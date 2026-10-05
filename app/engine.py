@@ -8,12 +8,15 @@
 3. 预演分配：用水点按优先级从高到低排序，同级按编号升序；依次求解
    “剩余水源上限 + 剩余共享管段容量”下该点可获得的最大流量（Dinic 最大流），
    被占用的水源额度与管段容量对后续点不再重复可用。
+4. 复水预演（rehearse_restoration）：以当前管网与阀位为起点，按提交的有序
+   开关步骤逐步叠加阀位，每步都按无向开启管段规则复核互锁水源，首个冲突
+   即定位返回；全程在内存中进行，不改动任何实际状态。
 """
 from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 EPS = 1e-9
@@ -724,3 +727,95 @@ def _isolation_constraints(
                 "closed_valves": closed,
             })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 复水：按阀门操作清单逐步预演（不改动实际状态）
+# --------------------------------------------------------------------------- #
+def _valve_snapshot(valves: dict[str, Valve]) -> list[dict]:
+    """全量阀位快照（按阀门编号排序），用于返回“每步阀位”与执行时复核。"""
+    return [
+        {"valve_id": vid, "pipe_id": v.pipe_id, "is_open": v.is_open}
+        for vid, v in sorted(valves.items())
+    ]
+
+
+def step_result(
+    step_no: int,
+    valve_id: str,
+    action: str,
+    changed: bool,
+    network: Network,
+) -> dict:
+    """某一步安全落地后的逐步结果：阀位 + 沿用现有口径的供水/欠供分派。
+
+    预演保存与实际执行共用本函数，保证“所见”与“执行所得”口径一致。
+    """
+    sim = simulate(network)
+    return {
+        "step_no": step_no,
+        "valve_id": valve_id,
+        "action": action,
+        "changed": changed,
+        "valves": _valve_snapshot(network.valves),
+        "closed_valves": sim["closed_valves"],
+        "allocations": sim["allocations"],
+        "totals": sim["totals"],
+        "source_utilization": sim["source_utilization"],
+        "pipe_utilization": sim["pipe_utilization"],
+    }
+
+
+def rehearse_restoration(
+    network: Network, steps: list[tuple[str, str]]
+) -> tuple[list[dict], Optional[dict]]:
+    """复水逐步预演：以当前阀位为起点，逐步套用有序开关步骤。
+
+    - 全程只在内存中叠加阀位，不修改传入的 network，更不写库；
+    - 每步落地后立即按无向开启管段规则检查不可并联水源；
+    - 首个冲突即返回 (此前安全步骤的预演列表, 冲突信息)，冲突信息含步骤位置、
+      连通水源与节点路径；全部安全则返回 (全部步骤预演, None)。
+
+    steps 为 (valve_id, 'open'|'close') 的有序列表；调用方负责
+    “非空 / 未知阀门 / 非法动作 / 阀门编号重复”的条目级校验。
+    """
+    previews: list[dict] = []
+    working: dict[str, Valve] = dict(network.valves)
+
+    for i, (valve_id, action) in enumerate(steps, start=1):
+        target_open = action == "open"
+        changed = working[valve_id].is_open != target_open
+        working[valve_id] = replace(working[valve_id], is_open=target_open)
+
+        current = Network(
+            network.nodes,
+            network.pipes,
+            working,
+            network.forbidden_pairs,
+            network.valves_by_pipe,
+        )
+
+        violations = find_forbidden_connections(current)
+        if violations:
+            a, b, path = violations[0]
+            conflict = {
+                "step_no": i,
+                "location": f"steps[{i - 1}]",
+                "valve_id": valve_id,
+                "action": action,
+                "source_a": a,
+                "source_b": b,
+                "path": path,
+                "code": "forbidden_connected",
+                "message": (
+                    f"第 {i} 步（{action} {valve_id}）将使不可并联水源 "
+                    f"{a} 与 {b} 经开启管段连通：" + " -> ".join(path)
+                ),
+            }
+            return previews, conflict
+
+        previews.append(
+            step_result(i, valve_id, action, changed, current)
+        )
+
+    return previews, None
